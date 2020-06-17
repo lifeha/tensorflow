@@ -26,6 +26,7 @@ limitations under the License.
 #include "llvm/IR/Value.h"
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/shape.h"
+#include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/core/platform/logging.h"
@@ -42,12 +43,9 @@ namespace llvm_ir {
 // are supported.
 class IrArray {
  public:
-  // A multidimensional index into an IrArray. The index for dimension zero is
-  // first in the vector. This is the reverse order of the notation used for
-  // describing the dimensions of an array. That is, for a [4 x 3 x 2] array
-  // dimension zero has size 2, dimension one has size 3, and dimension two has
-  // size 4. Thus the index {1, 2, 3} indexes the last element of this [4 x 3 x
-  // 2] array.
+  // A multidimensional index into an IrArray. All the runtime indices
+  // (multidim) and dimensions (Shape::dimensions(), absl::Span<const int64>)
+  // are major-first.
   //
   // This may also keep a linear index and the layout and dimensions it was
   // emitted for; if the shape where this `Index` is used matches, the linear
@@ -60,28 +58,6 @@ class IrArray {
       CHECK(index_ty->isIntegerTy());
     }
 
-    // Constructs an index from multi-dimensional index "multidim". The linear
-    // index is set to nullptr.
-    explicit Index(absl::Span<llvm::Value* const> multidim,
-                   llvm::Type* index_ty = nullptr)
-        : multidim_(multidim.begin(), multidim.end()) {
-      if (size() == 0) {
-        index_type_ = index_ty;
-      } else {
-        for (const auto* dim : multidim) {
-          CHECK_NE(dim, nullptr);
-        }
-        index_type_ = multidim[0]->getType();
-        if (index_ty != nullptr) {
-          CHECK_EQ(index_type_, index_ty);
-        }
-      }
-      CHECK_NE(index_type_, nullptr);
-      CHECK(absl::c_all_of(multidim, [&](llvm::Value* v) {
-        return index_type_ == v->getType();
-      }));
-    }
-
     // Constructs an index from linear index "linear" and computes the
     // multi-dimensional index from "linear" and "shape". "b" is the IR
     // builder to emit the index of each dimension in the multi-dimensional
@@ -89,6 +65,11 @@ class IrArray {
     //
     // Precondition: "shape" has a layout.
     Index(llvm::Value* linear, const Shape& shape, llvm::IRBuilder<>* b);
+
+    // Similar to the above constructor except using "dynamic_dims" instead of
+    // shape's static dimension to constructs the index.
+    Index(llvm::Value* linear, const Shape& shape,
+          absl::Span<llvm::Value*> dynamic_dims, llvm::IRBuilder<>* b);
 
     // Constructs an index from a multi-dimensional index. 'shape' is the shape
     // for which the multi-dimensional index is used. 'index_type' is the type
@@ -107,12 +88,15 @@ class IrArray {
     // Returns an index that adds `addend` to the given `dim` of the object.
     Index AddOffsetToDim(llvm::Value* addend, int64 dim,
                          llvm::IRBuilder<>* b) const {
-      std::vector<llvm::Value*> multi_index = multidim();
-      multi_index[dim] = b->CreateAdd(multi_index[dim], addend);
-      return Index(multi_index, index_type_);
+      Index with_offset = *this;
+      with_offset.linear_ = nullptr;
+      with_offset.multidim_[dim] =
+          b->CreateAdd(with_offset.multidim_[dim], addend);
+      return with_offset;
     }
 
     const std::vector<llvm::Value*>& multidim() const { return multidim_; }
+    const std::vector<int64>& dims() const { return dims_; }
     llvm::Value* linear() const { return linear_; }
 
     size_t size() const { return multidim().size(); }
@@ -125,6 +109,17 @@ class IrArray {
     const_iterator end() const { return multidim().end(); }
 
     bool LinearValidOnShape(const Shape& a) const;
+
+    bool ShapeIsCompatible(const Shape& a) const {
+      Shape own_shape = ShapeUtil::MakeShape(a.element_type(), dims_);
+      *own_shape.mutable_layout() = layout_;
+      // The shape 'a' could have dynamic dimensions set. Before we check for
+      // equality, we need to copy the information which dimensions are dynamic.
+      for (int64 i = 0; i < a.rank(); ++i) {
+        own_shape.set_dynamic_dimension(i, a.is_dynamic_dimension(i));
+      }
+      return ShapeUtil::Equal(own_shape, a);
+    }
 
     // Given that "this" is the target index of a reshape from `input_shape`
     // to `output_shape`, returns the source index.
@@ -145,9 +140,9 @@ class IrArray {
 
     // Given that "this" is the target index of a transpose from `operand_shape`
     // to `shape` with the given dimension mapping, returns the source index.
-    Index SourceIndexOfTranspose(const Shape& shape, const Shape& operand_shape,
-                                 absl::Span<const int64> dimension_mapping,
-                                 llvm::IRBuilder<>* builder) const;
+    Index SourceIndexOfTranspose(
+        const Shape& shape, const Shape& operand_shape,
+        absl::Span<const int64> dimension_mapping) const;
 
     // Given that "this" is the target index of a bitcast from `operand_shape`
     // to `shape`, returns the source index.
@@ -163,6 +158,10 @@ class IrArray {
     // Linearizes the index into the given shape, i.e. reshapes it to rank-1 and
     // returns the index into the sole dimension 0 of the new shape.
     llvm::Value* Linearize(absl::Span<const int64> dimensions,
+                           llvm::IRBuilder<>* builder) const;
+
+    // Linearizes the index into the given dynamic dimensions.
+    llvm::Value* Linearize(const std::vector<llvm::Value*>& dynamic_dims,
                            llvm::IRBuilder<>* builder) const;
 
     llvm::Type* GetType() const { return index_type_; }
@@ -185,6 +184,11 @@ class IrArray {
 
     void Delinearize(std::vector<llvm::Value*>* multidim, llvm::Value* linear,
                      const Shape& shape, llvm::IRBuilder<>* b) const;
+
+    // Delinearize the linear index with the dynamic dimensions.
+    void Delinearize(std::vector<llvm::Value*>* multidim, llvm::Value* linear,
+                     const Shape& shape, absl::Span<llvm::Value*> dynamic_dims,
+                     llvm::IRBuilder<>* b) const;
 
     std::vector<llvm::Value*> multidim_;
 

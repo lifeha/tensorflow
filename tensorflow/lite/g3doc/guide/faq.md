@@ -30,37 +30,52 @@ Since the number of TensorFlow Lite operations is smaller than TensorFlow's,
 some inference models may not be able to convert. For unimplemented operations,
 take a look at the question on
 [missing operators](faq.md#why-are-some-operations-not-implemented-in-tensorflow-lite).
-Unsupported operators include embeddings and LSTM/RNNs. For conversion issues
-not related to missing operations, search our
+Unsupported operators include embeddings and LSTM/RNNs. For models with
+LSTM/RNNs, you can also try the experimental API
+[OpHint](https://www.tensorflow.org/api_docs/python/tf/lite/OpHint) to convert.
+Models with control flow ops (Switch, Merge, etc) are not convertible at the
+moment, but we are working on adding support for control flow in Tensorflow
+Lite, please see
+[GitHub issues](https://github.com/tensorflow/tensorflow/issues/28485).
+
+For conversion issues not related to missing operations or control flow ops,
+search our
 [GitHub issues](https://github.com/tensorflow/tensorflow/issues?q=label%3Acomp%3Alite+)
 or file a [new one](https://github.com/tensorflow/tensorflow/issues).
 
 #### How do I determine the inputs/outputs for GraphDef protocol buffer?
 
-The easiest way to inspect a graph from a `.pb` file is to use the
+The easiest way to inspect a graph from a `.pb` file is to use
+[Netron](https://github.com/lutzroeder/netron), an open-source viewer for
+machine learning models.
+
+If Netron cannot open the graph, you can try the
 [summarize_graph](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/graph_transforms/README.md#inspecting-graphs)
 tool.
 
-If that approach yields an error, you can visualize the GraphDef with
+If the summarize_graph tool yields an error, you can visualize the GraphDef with
 [TensorBoard](https://www.tensorflow.org/guide/summaries_and_tensorboard) and
 look for the inputs and outputs in the graph. To visualize a `.pb` file, use the
 [`import_pb_to_tensorboard.py`](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/tools/import_pb_to_tensorboard.py)
 script like below:
 
-```
+```shell
 python import_pb_to_tensorboard.py --model_dir <model path> --log_dir <log dir path>
 ```
 
 #### How do I inspect a `.tflite` file?
 
-TensorFlow Lite models can be visualized using the
+[Netron](https://github.com/lutzroeder/netron) is the easiest way to visualize a
+TensorFlow Lite model.
+
+If Netron cannot open your TensorFlow Lite model, you can try the
 [visualize.py](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/tools/visualize.py)
 script in our repository.
 
 *   [Clone the TensorFlow repository](https://www.tensorflow.org/install/source)
 *   Run the `visualize.py` script with bazel:
 
-```
+```shell
 bazel run //tensorflow/lite/tools:visualize model.tflite visualized_model.html
 ```
 
@@ -93,8 +108,8 @@ random data to feed to the interpreter.
 
 #### How do I reduce the size of my converted TensorFlow Lite model?
 
-[Post-training quantization](../performance/post_training_quantization.md) can be
-used during conversion to TensorFlow Lite to reduce the size of the model.
+[Post-training quantization](../performance/post_training_quantization.md) can
+be used during conversion to TensorFlow Lite to reduce the size of the model.
 Post-training quantization quantizes weights to 8-bits of precision from
 floating-point and dequantizes them during runtime to perform floating point
 computations. However, note that this could have some accuracy implications.

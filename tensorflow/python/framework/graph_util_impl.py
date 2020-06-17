@@ -20,17 +20,21 @@ from __future__ import division
 from __future__ import print_function
 import copy
 import re
+
 import six
 
-from tensorflow.core.framework import attr_value_pb2
 from tensorflow.core.framework import graph_pb2
 from tensorflow.core.framework import node_def_pb2
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
-from tensorflow.python.framework import tensor_util
-from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import deprecation
+from tensorflow.python.util import lazy_loader
 from tensorflow.python.util.tf_export import tf_export
+
+# A normal import here would generate circular dependencies.
+convert_to_constants = lazy_loader.LazyLoader(
+    "convert_to_constants", globals(),
+    "tensorflow.python.framework.convert_to_constants")
 
 _VARIABLE_OPS = {
     "Assign",
@@ -44,6 +48,15 @@ _VARIABLE_OPS = {
     "Variable",
     "VariableV2",
 }
+
+_CONTROL_FLOW_OP_NAMES_OR_IDENTITY = [
+    "Switch",
+    "Enter",
+    "Exit",
+    "Identity",
+    "Merge",
+    "NextIteration",
+]
 
 
 def _is_variable_op(op):
@@ -113,6 +126,14 @@ def _node_name(n):
     return n.split(":")[0]
 
 
+def _get_colocated_node_name(colocated_node_name):
+  """Decodes colocated node name and returns it without loc:@ prepended."""
+  colocated_node_decoded = colocated_node_name.decode("utf-8")
+  if colocated_node_decoded.startswith("loc:@"):
+    return colocated_node_decoded[5:]
+  return colocated_node_decoded
+
+
 def _extract_graph_summary(graph_def):
   """Extracts useful information from the graph and returns them."""
   name_to_input_name = {}  # Keyed by the dest node name.
@@ -126,6 +147,11 @@ def _extract_graph_summary(graph_def):
     n = _node_name(node.name)
     name_to_node[n] = node
     name_to_input_name[n] = [_node_name(x) for x in node.input]
+    # Prevent colocated nodes from being lost.
+    if "_class" in node.attr:
+      for colocated_node_name in node.attr["_class"].list.s:
+        name_to_input_name[n].append(
+            _get_colocated_node_name(colocated_node_name))
     name_to_seq_num[n] = seq
     seq += 1
   return name_to_input_name, name_to_node, name_to_seq_num
@@ -241,67 +267,21 @@ def convert_variables_to_constants(sess,
 
   Returns:
     GraphDef containing a simplified version of the original.
+
+  Raises:
+    RuntimeError: if a DT_RESOURCE op is found whose ancestor Variables are both
+      blacklisted AND whitelisted for freezing.
   """
-  # This graph only includes the nodes needed to evaluate the output nodes, and
-  # removes unneeded nodes like those involved in saving and assignment.
-  inference_graph = extract_sub_graph(input_graph_def, output_node_names)
-
-  found_variables = {}
-  variable_names = []
-  variable_dict_names = []
-  for node in inference_graph.node:
-    if node.op in ["Variable", "VariableV2", "VarHandleOp"]:
-      variable_name = node.name
-      if ((variable_names_whitelist is not None and
-           variable_name not in variable_names_whitelist) or
-          (variable_names_blacklist is not None and
-           variable_name in variable_names_blacklist)):
-        continue
-      variable_dict_names.append(variable_name)
-      if node.op == "VarHandleOp":
-        variable_names.append(variable_name + "/Read/ReadVariableOp:0")
-      else:
-        variable_names.append(variable_name + ":0")
-  if variable_names:
-    returned_variables = sess.run(variable_names)
-  else:
-    returned_variables = []
-  found_variables = dict(zip(variable_dict_names, returned_variables))
-  logging.info("Froze %d variables.", len(returned_variables))
-
-  output_graph_def = graph_pb2.GraphDef()
-  how_many_converted = 0
-  for input_node in inference_graph.node:
-    output_node = node_def_pb2.NodeDef()
-    if input_node.name in found_variables:
-      output_node.op = "Const"
-      output_node.name = input_node.name
-      dtype = input_node.attr["dtype"]
-      data = found_variables[input_node.name]
-      output_node.attr["dtype"].CopyFrom(dtype)
-      output_node.attr["value"].CopyFrom(
-          attr_value_pb2.AttrValue(
-              tensor=tensor_util.make_tensor_proto(
-                  data, dtype=dtype.type, shape=data.shape)))
-      how_many_converted += 1
-    elif input_node.op == "ReadVariableOp" and (
-        input_node.input[0] in found_variables):
-      # The preceding branch converts all VarHandleOps of ResourceVariables to
-      # constants, so we need to convert the associated ReadVariableOps to
-      # Identity ops.
-      output_node.op = "Identity"
-      output_node.name = input_node.name
-      output_node.input.extend([input_node.input[0]])
-      output_node.attr["T"].CopyFrom(input_node.attr["dtype"])
-      if "_class" in input_node.attr:
-        output_node.attr["_class"].CopyFrom(input_node.attr["_class"])
-    else:
-      output_node.CopyFrom(input_node)
-    output_graph_def.node.extend([output_node])
-
-  output_graph_def.library.CopyFrom(inference_graph.library)
-  logging.info("Converted %d variables to const ops.", how_many_converted)
-  return output_graph_def
+  ret = convert_to_constants.convert_variables_to_constants_from_session_graph(
+      session=sess,
+      graph_def=input_graph_def,
+      output_node_names=output_node_names,
+      variable_names_whitelist=variable_names_whitelist,
+      variable_names_blacklist=variable_names_blacklist)
+  # The previous code logic generated an empty versions field, we clear it here
+  # to maintain backwards compatibility.
+  ret.versions.Clear()
+  return ret
 
 
 @deprecation.deprecated(
